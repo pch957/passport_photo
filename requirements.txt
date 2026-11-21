@@ -1,0 +1,10 @@
+# 中国护照证件照脚本依赖（Python 3.12+，本项目在 3.14 验证）
+#   venv/bin/pip install -r requirements.txt
+#
+# 用 contrib 的 headless 版：既带 cv2.face.createFacemarkLBF，又不拉 GUI 依赖。
+# 注意别同时装 opencv-python / opencv-contrib-python 等多个变体，它们共用 cv2
+# 命名空间会互相覆盖；混装了就用新 venv 重装一遍。
+rembg>=2.0.87
+opencv-contrib-python-headless>=4.10
+pillow>=13.0
+numpy>=2.0

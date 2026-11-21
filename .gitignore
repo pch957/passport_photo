@@ -1,0 +1,19 @@
+# Python 环境与缓存
+venv/
+__pycache__/
+*.py[cod]
+
+# 模型权重：脚本按 sha256 自动下载，不入库（YuNet 230KB / FacemarkLBF 54MB）
+models/
+
+# rembg / matplotlib 的本地缓存目录
+.rembg/
+.matplotlib/
+
+# 照片与成品：真实人像涉及隐私，默认不入库（确实要加就 git add -f）
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.DNG
+*.dng
