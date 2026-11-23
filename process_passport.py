@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -88,6 +89,7 @@ except Exception:  # pragma: no cover - 老版本没有该 API
 CANVAS_W, CANVAS_H = 354, 472
 HEAD_W_MIN, HEAD_W_MAX = 177, 260        # 头部宽度（两耳之间）
 HEAD_H_MIN, HEAD_H_MAX = 330, 390        # 头部高度（下巴 → 头顶）
+HEAD_H_GUARD = 3                        # 选缩放时留的余量：成品复测有 1~2% 噪声
 TOP_MARGIN_MIN, TOP_MARGIN_MAX = 35, 59  # 头顶留白
 BOTTOM_GAP_MIN = 82                      # 下巴距下边缘
 FILE_KB_MIN, FILE_KB_MAX = 40.0, 75.0    # 文件体积
@@ -562,8 +564,9 @@ def solve_scale(geom: HeadGeom, top_margin: float, target_head_h: float,
     冲突时优先保证头部高度——人脸识别看的是头部尺寸，头宽只是构图参考——并在
     报告里以 WARN 说明，而不是把头部缩到规范下限以下。
     """
-    hard_lo = HEAD_H_MIN / geom.head_h
-    hard_hi = min(HEAD_H_MAX / geom.head_h,
+    # 区间两端各让 HEAD_H_GUARD：成品复测有 1~2% 噪声，贴着 330 选就会掉到 328/329
+    hard_lo = (HEAD_H_MIN + HEAD_H_GUARD) / geom.head_h
+    hard_hi = min((HEAD_H_MAX - HEAD_H_GUARD) / geom.head_h,
                   (CANVAS_H - top_margin - BOTTOM_GAP_MIN) / geom.head_h)
     if hard_lo > hard_hi:      # 头太长，留白放不下
         warnings.append("头高与下巴留白冲突，已取留白允许范围内的最大头部")
@@ -652,6 +655,22 @@ def print_report(rows: list[tuple[str, str, str, bool | str | None]]) -> bool:
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
+def write_json_report(path: str, rows: list, warnings: list, metrics: dict) -> None:
+    """自检结果落 JSON：第四位映射成 PASS/WARN/FAIL/INFO，服务程序可直接渲染。"""
+    state = {True: "PASS", False: "FAIL", "warn": "WARN", None: "INFO"}
+    payload = {
+        "rows": [{"name": r[0], "value": r[1], "req": r[2], "state": state[r[3]]} for r in rows],
+        "warnings": list(warnings),
+        "all_pass": all(r[3] in (True, None, "warn") for r in rows),
+        "metrics": metrics,
+    }
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+
 def process(args: argparse.Namespace) -> int:
     warnings: list[str] = []
     log(f"[-] 读取 {args.input}")
@@ -738,11 +757,15 @@ def process(args: argparse.Namespace) -> int:
     # 3) 构图：缩放 + 旋转一次仿射；按成品残差再校正一次倾斜
     ref_frac = face.bbox[3] / float(bgr.shape[0])   # 源图里人脸占画面高度的比例
     canvas = None
+    canvas_mask: np.ndarray | None = None
     geom_out: HeadGeom | None = None
     face_out: Face | None = None
     scale = 1.0
-    for attempt in range(2):
-        scale = solve_scale(geom, args.top_margin, args.target_head_h, warnings)
+    gain = 1.0     # 源图量法 → 成品量法 的实测修正系数（检测噪声 + 重采样，约 1~2%）
+    best: tuple | None = None    # (头高偏差, canvas, mask, geom_out, face_out, scale)
+    prev_err: float | None = None
+    for attempt in range(4):
+        scale = solve_scale(geom.scaled(gain), args.top_margin, args.target_head_h, warnings)
         m = place_matrix(geom, face.eye_center, angle, scale, args.top_margin)
         canvas = warp(bgr, m, scale)
         canvas_mask = warp(barrier_u8, m, scale, nearest=True) > 127 \
@@ -753,14 +776,40 @@ def process(args: argparse.Namespace) -> int:
         if geom_out is None or face_out is None:
             warnings.append("成品中未再次检测到人脸，无法自检构图")
             break
+        # 只朝“更靠近规范”的方向走，并且永远保留最好的一版：成品复测在特写、
+        # 发际被提亮吃掉等情况下会反向偏移，不锁最优就会越修越糟。
+        h_px = round(geom_out.head_h)
+        err = 0.0 if HEAD_H_MIN <= h_px <= HEAD_H_MAX else \
+            min(abs(h_px - HEAD_H_MIN), abs(h_px - HEAD_H_MAX))
+        if best is None or err < best[0]:
+            best = (err, canvas, canvas_mask, geom_out, face_out, scale)
         residual = face_out.roll_angle
         if attempt == 0 and abs(residual) > 1.5:
             log(f"[-] 成品残差倾斜 {residual:.2f}°，追加校正后重建")
             angle += residual
             continue
+        # 闭环校正：源图量出来的头高和成品复测的头高有 1~2% 系统偏差（人脸框随
+        # 占比变化、重采样、背景提亮都会影响 landmark）。不闭环就会卡在 328/329
+        # 这种只差一两像素的位置——明明该落在区间里。
+        if err > 0 and attempt < 3 and (prev_err is None or err < prev_err):
+            # 只补到区间内侧一点点，不奔着目标值去：差 1px 就动 1px 的量，
+            # 大幅改缩放在这类照片上会把成品量法拉得更低。
+            want = (HEAD_H_MIN + HEAD_H_GUARD) if h_px < HEAD_H_MIN else (HEAD_H_MAX - HEAD_H_GUARD)
+            fix = want / geom_out.head_h
+            if 0.70 <= fix <= 1.40:
+                log(f"[-] 成品头高 {geom_out.head_h:.0f}px 不在 {HEAD_H_MIN}-{HEAD_H_MAX}，"
+                    f"按实测偏差修正缩放（×{fix:.3f}）后重建")
+                prev_err = err
+                gain *= fix
+                continue
         log(f"[-] 缩放系数 {scale:.4f}（目标头高 {args.target_head_h:.0f}px）"
             f" 成品残差倾斜 {residual:.2f}°")
         break
+
+    if best is not None and best[1] is not canvas:
+        _, canvas, canvas_mask, geom_out, face_out, scale = best
+        warnings.append("多次重建后取头高最接近规范的一版")
+        log(f"[-] 取最优一版：成品头高 {geom_out.head_h:.0f}px")
 
     assert canvas is not None
     kb = 0.0
@@ -782,7 +831,11 @@ def process(args: argparse.Namespace) -> int:
     if geom_out is not None and face_out is not None:
         top_margin = geom_out.eye_y - geom_out.crown_off
         bottom_gap = CANVAS_H - top_margin - geom_out.head_h
-        w_ok = HEAD_W_MIN <= geom_out.head_w <= HEAD_W_MAX
+        # 判定和显示都用四舍五入后的整数：显示 260 却判 FAIL（实际 260.4）会让人
+        # 完全看不懂；人工量照片读的也是整数像素。
+        h_px, w_px = round(geom_out.head_h), round(geom_out.head_w)
+        tm_px, bg_px = round(top_margin), round(bottom_gap)
+        w_ok = HEAD_W_MIN <= w_px <= HEAD_W_MAX
         if not w_ok and width_unavoidable(geom_out):
             w_state: bool | str = "warn"
             need_h = HEAD_W_MAX / geom_out.head_w * geom_out.head_h
@@ -795,14 +848,14 @@ def process(args: argparse.Namespace) -> int:
         else:
             w_state = w_ok
         rows += [
-            ("头部高度", f"{geom_out.head_h:.0f} px", f"{HEAD_H_MIN}-{HEAD_H_MAX} px",
-             HEAD_H_MIN <= geom_out.head_h <= HEAD_H_MAX),
-            ("头部宽度(含耳)", f"{geom_out.head_w:.0f} px", f"{HEAD_W_MIN}-{HEAD_W_MAX} px",
+            ("头部高度", f"{h_px} px", f"{HEAD_H_MIN}-{HEAD_H_MAX} px",
+             HEAD_H_MIN <= h_px <= HEAD_H_MAX),
+            ("头部宽度(含耳)", f"{w_px} px", f"{HEAD_W_MIN}-{HEAD_W_MAX} px",
              w_state),
-            ("头顶留白", f"{top_margin:.0f} px", f"{TOP_MARGIN_MIN}-{TOP_MARGIN_MAX} px",
-             TOP_MARGIN_MIN <= top_margin <= TOP_MARGIN_MAX),
-            ("下巴距下边缘", f"{bottom_gap:.0f} px", f"≥{BOTTOM_GAP_MIN} px",
-             bottom_gap >= BOTTOM_GAP_MIN),
+            ("头顶留白", f"{tm_px} px", f"{TOP_MARGIN_MIN}-{TOP_MARGIN_MAX} px",
+             TOP_MARGIN_MIN <= tm_px <= TOP_MARGIN_MAX),
+            ("下巴距下边缘", f"{bg_px} px", f"≥{BOTTOM_GAP_MIN} px",
+             bg_px >= BOTTOM_GAP_MIN),
             ("人脸水平", f"{face_out.roll_angle:.2f}°", "≤1.5°",
              abs(face_out.roll_angle) <= 1.5),
         ]
@@ -818,6 +871,14 @@ def process(args: argparse.Namespace) -> int:
     rows.append(("检测引擎", detector.name + ("+LBF" if refine_info else ""), "YuNet", None))
 
     ok = print_report(rows)
+    if args.json_report:
+        metrics: dict = {"engine": detector.name + ("+LBF" if refine_info else ""),
+                         "kb": round(kb, 1), "quality": quality}
+        if geom_out is not None and face_out is not None:
+            metrics.update(head_h=round(geom_out.head_h, 1), head_w=round(geom_out.head_w, 1),
+                           top_margin=round(top_margin, 1), bottom_gap=round(bottom_gap, 1),
+                           residual_roll=round(face_out.roll_angle, 2), scale=round(scale, 5))
+        write_json_report(args.json_report, rows, warnings, metrics)
     for wmsg in warnings:
         log(f"  ! {wmsg}")
     if args.write:
@@ -960,8 +1021,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--whiten-tol", type=int, default=14, help="纯白化泛洪容差")
     p.add_argument("--no-rotate", dest="rotate", action="store_false", help="关闭水平校正")
     p.add_argument("--max-roll", type=float, default=15.0, help="超过该倾斜角就不校正（度）")
-    p.add_argument("--target-head-h", type=float, default=340.0, help="目标头部高度 px")
-    p.add_argument("--top-margin", type=float, default=45.0, help="目标头顶留白 px")
+    # 规范给的 330-390 在这张画布上取不到上限：472 = 头顶留白(≥35) + 头高 +
+    # 下巴留白(≥82)，头高最多 472-35-82 = 355。可行区间 [330, 355]。
+    # 目标取偏上的 346：成品复测比源图量法低 1~5%（发际被提亮、人脸框随占比
+    # 变化），贴着下限选就会掉到 328/329。
+    p.add_argument("--target-head-h", type=float, default=346.0,
+                   help="目标头部高度 px（可行区间 330-355，默认 346 给复测噪声留余量）")
+    p.add_argument("--top-margin", type=float, default=40.0,
+                   help="目标头顶留白 px（规范 35-59；取小值给头高和下巴留白腾空间）")
     p.add_argument("--chin-iod-ratio", type=float, default=CHIN_IOD_RATIO,
                    help="(下巴-眼线)/瞳距")
     p.add_argument("--crown-ratio", type=float, default=CROWN_RATIO,
@@ -972,6 +1039,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--dpi", type=int, default=600, help="写入 JPEG 的 DPI")
     p.add_argument("--no-write", dest="write", action="store_false", help="只分析不写文件")
     p.add_argument("--debug", nargs="?", const=True, default=False, help="输出调试叠加图（可跟路径）")
+    p.add_argument("--json-report", help="把自检结果写成 JSON（供服务程序读取，不影响终端输出）")
     p.add_argument("--strict", action="store_true", help="自检不通过时以非零码退出")
     p.set_defaults(whiten=True, rotate=True, write=True)
     return p.parse_args(argv)
