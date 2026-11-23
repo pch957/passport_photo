@@ -111,10 +111,75 @@ BG_BGR = BG_RGB[::-1]                    # 同上，cv2 的通道顺序
 # 数值来源与官方出处见 docs/specs.md；apply_spec() 把选中的规格绑到上面的常量。
 # --------------------------------------------------------------------------
 SPECS: dict[str, dict] = {
+    # 中国护照 / “中国领事”App：33×48mm @600DPI
     "passport": dict(
         name="中国护照", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
         chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
         aim_head_h=346.0, aim_top_margin=40.0),
+
+    # 美国签证 DS-160：2×2 英寸，官方数字通道要求正方形 JPEG 600–1200px、≤240KB。
+    # 头部（发顶到下巴）占画面高度 50–69%；眼睛距下边缘 56–69%。
+    # 头顶留白官方没给，是按眼位反推的构图区间（眼位 = 留白 + 0.49×头高）。
+    "us_visa": dict(
+        name="美国签证", canvas=(600, 600), head_h=(300, 414), top_margin=(40, 70),
+        chin_gap=110, head_w=(200, 480), bg=(255, 255, 255), kb=(60.0, 240.0), dpi=300,
+        aim_head_h=360.0, aim_top_margin=55.0),
+
+    # 澳大利亚护照：35×45mm @600DPI，官方脸部尺寸 32–36mm（头顶皮肤到下下巴）。
+    # 官方只发冲印件、没有数字通道，留白按 9–15% 画面高度推导。
+    "au_passport": dict(
+        name="澳大利亚护照", canvas=(827, 1063), head_h=(756, 850), top_margin=(95, 160),
+        chin_gap=90, head_w=(520, 820), bg=(255, 255, 255), kb=(120.0, 1200.0), dpi=600,
+        aim_head_h=803.0, aim_top_margin=125.0),
+
+    # 澳大利亚签证（ImmiAccount 上传）：官方推荐 1200×1600 JPEG，70KB–3.5MB。
+    # 签证页没有 mm 脸部尺寸，沿用护照的 71–80% 画面高度作为构图区间（推导）。
+    "au_visa": dict(
+        name="澳大利亚签证", canvas=(1200, 1600), head_h=(1136, 1280), top_margin=(145, 240),
+        chin_gap=120, head_w=(800, 1250), bg=(255, 255, 255), kb=(70.0, 3500.0), dpi=300,
+        aim_head_h=1200.0, aim_top_margin=190.0),
+
+    # 第二代居民身份证 GA 461-2004：358×441px @350dpi（26×32mm），纯白底。
+    # 官方给的是脸宽 15±1mm 与「头部占照片 2/3」，头高按 2/3 画面高度取值；
+    # 眼睛距下边缘 ≥207px 换算成头顶留白上限约 90px，这里收紧到 60 更稳。
+    "idcard": dict(
+        name="居民身份证", canvas=(358, 441), head_h=(270, 320), top_margin=(20, 60),
+        chin_gap=60, head_w=(180, 240), bg=(255, 255, 255), kb=(14.0, 30.0), dpi=350,
+        aim_head_h=294.0, aim_top_margin=40.0),
+
+    # 一寸 25×35mm @300dpi：没有国家标准，295×413 的背书来自国考报名
+    # 「宽≥295px、高≥413px」。头部区间按通用构图（占画面 60–73%）取，属约定俗成。
+    "one_inch": dict(
+        name="一寸照", canvas=(295, 413), head_h=(250, 300), top_margin=(25, 55),
+        chin_gap=55, head_w=(165, 235), bg=(255, 255, 255), kb=(10.0, 200.0), dpi=300,
+        aim_head_h=275.0, aim_top_margin=38.0),
+
+    # 二寸 35×49mm @300dpi：教育部教育考试院对「2 寸 = 3.5×4.9cm」有官方背书。
+    "two_inch": dict(
+        name="二寸照", canvas=(413, 579), head_h=(350, 430), top_margin=(30, 70),
+        chin_gap=75, head_w=(230, 330), bg=(255, 255, 255), kb=(15.0, 200.0), dpi=300,
+        aim_head_h=390.0, aim_top_margin=48.0),
+
+    # 英国签证/许可在线申请（UKVI）：jpg、≥600×750px、50KB–6MB。
+    # 官方要浅色系背景（冲印件写 cream / light grey），所以不刷成纯白。
+    # 头部 29–34mm 是护照冲印件口径（45mm 高 → 64–76% 画面高度），按同比例落到 750px。
+    "uk_visa": dict(
+        name="英国签证", canvas=(600, 750), head_h=(483, 567), top_margin=(68, 112),
+        chin_gap=80, head_w=(360, 560), bg=(235, 235, 235), kb=(50.0, 6000.0), dpi=300,
+        aim_head_h=525.0, aim_top_margin=90.0),
+
+    # 申根签证（德国官方口径）：35×45mm，脸（下巴到发际）32–36mm，浅色/中性灰背景。
+    # 申根没有统一的线上上传通道，出图按 600DPI 冲印件尺寸生成。
+    "schengen": dict(
+        name="申根签证", canvas=(827, 1063), head_h=(756, 850), top_margin=(95, 160),
+        chin_gap=90, head_w=(520, 820), bg=(235, 235, 235), kb=(120.0, 1200.0), dpi=600,
+        aim_head_h=803.0, aim_top_margin=125.0),
+
+    # 加拿大在线申请：3:2 竖幅 ≥1200×1800px、200KB–5MB，下巴到头顶占画面 45–50%。
+    "ca_visa": dict(
+        name="加拿大签证", canvas=(1200, 1800), head_h=(810, 900), top_margin=(150, 300),
+        chin_gap=300, head_w=(600, 950), bg=(255, 255, 255), kb=(200.0, 5000.0), dpi=300,
+        aim_head_h=855.0, aim_top_margin=225.0),
 }
 DEFAULT_SPEC = "passport"
 
@@ -123,7 +188,7 @@ def apply_spec(spec_id: str) -> dict:
     """把规格表绑到模块常量上：全流程只读这些常量，绑一次就整体切换规格。"""
     global CANVAS_W, CANVAS_H, HEAD_W_MIN, HEAD_W_MAX, HEAD_H_MIN, HEAD_H_MAX
     global TOP_MARGIN_MIN, TOP_MARGIN_MAX, BOTTOM_GAP_MIN, FILE_KB_MIN, FILE_KB_MAX
-    global BG_RGB, BG_BGR
+    global BG_RGB, BG_BGR, HEAD_H_GUARD
     s = SPECS[spec_id]
     CANVAS_W, CANVAS_H = s["canvas"]
     HEAD_H_MIN, HEAD_H_MAX = s["head_h"]
@@ -133,6 +198,8 @@ def apply_spec(spec_id: str) -> dict:
     FILE_KB_MIN, FILE_KB_MAX = s["kb"]
     BG_RGB = s["bg"]
     BG_BGR = s["bg"][::-1]
+    # 复测噪声随画幅放大：护照 354px 上 3px 够了，1600px 的画布要按同比例放宽
+    HEAD_H_GUARD = max(3, round(CANVAS_H * 0.006))
     return s
 
 # 人体测量比例（test_geometry.py 里有标定用例，可用命令行覆盖）
