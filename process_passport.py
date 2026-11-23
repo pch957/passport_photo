@@ -37,11 +37,12 @@
       · 耳间头宽 = 眼线到下巴之间剪影宽度的高分位数（正好覆盖两耳）。
     源图与成品用同一套量法，自检才有意义。
 
- 约束冲突怎么办
-    规范同时要求 头高 330-390 与 两耳之间 177-260，两者之比上限 260/330≈0.79。
-    耳朵外张 + 发量厚的头型（本目录样本实测 0.82）数学上无法同时满足。脚本按
-    「构图留白 > 头部高度 > 头部宽度」取舍：宽度超限时报 WARN 并给出换算过程，
-    不把头部缩到规范下限以下（人脸识别看的是头部尺寸，缩头是更糟的选择）。
+ 头宽怎么处理
+    规范里还写着「两耳之间 177-260」，但耳朵外张 + 发量厚的头型（本目录样本实测
+    宽/高比 0.78~0.83，而规范极限 260/330≈0.79）在数学上无法与头高同时满足，
+    受理时看的是头部尺寸与居中，不是耳间宽。所以头宽只作为**内部软约束**参与选
+    缩放（尽量别把脸撑满画面），不再出现在自检报告里——给用户看一条既满足不了、
+    又不影响受理的 WARN，除了添堵没有别的用处。
 
  背景纯白化
     从画面边缘泛洪把近白背景压成 255，但泛洪以抠图遮罩为屏障——否则浅色衬衫上的
@@ -93,6 +94,46 @@ HEAD_H_GUARD = 3                        # 选缩放时留的余量：成品复�
 TOP_MARGIN_MIN, TOP_MARGIN_MAX = 35, 59  # 头顶留白
 BOTTOM_GAP_MIN = 82                      # 下巴距下边缘
 FILE_KB_MIN, FILE_KB_MAX = 40.0, 75.0    # 文件体积
+BG_RGB = (255, 255, 255)                 # 背景色（RGB，给人看的顺序）
+BG_BGR = BG_RGB[::-1]                    # 同上，cv2 的通道顺序
+
+# --------------------------------------------------------------------------
+# 规格表：一个证件类型一行，这里的数值就是构图依据与自检条目
+#   canvas       画布像素（宽, 高）
+#   head_h       头部高度硬区间（下巴 → 头顶，px）
+#   top_margin   头顶留白区间（px）
+#   chin_gap     下巴距下边缘下限（px）
+#   head_w       耳间头宽软区间：只参与选缩放，不出自检（见文件头说明）
+#   bg           背景色 RGB
+#   kb           交付 JPEG 体积区间
+#   dpi          写进 JPEG 的 DPI
+#   aim_head_h / aim_top_margin  构图目标值：取可行区间偏上，给成品复测噪声留余量
+# 数值来源与官方出处见 docs/specs.md；apply_spec() 把选中的规格绑到上面的常量。
+# --------------------------------------------------------------------------
+SPECS: dict[str, dict] = {
+    "passport": dict(
+        name="中国护照", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
+        chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
+        aim_head_h=346.0, aim_top_margin=40.0),
+}
+DEFAULT_SPEC = "passport"
+
+
+def apply_spec(spec_id: str) -> dict:
+    """把规格表绑到模块常量上：全流程只读这些常量，绑一次就整体切换规格。"""
+    global CANVAS_W, CANVAS_H, HEAD_W_MIN, HEAD_W_MAX, HEAD_H_MIN, HEAD_H_MAX
+    global TOP_MARGIN_MIN, TOP_MARGIN_MAX, BOTTOM_GAP_MIN, FILE_KB_MIN, FILE_KB_MAX
+    global BG_RGB, BG_BGR
+    s = SPECS[spec_id]
+    CANVAS_W, CANVAS_H = s["canvas"]
+    HEAD_H_MIN, HEAD_H_MAX = s["head_h"]
+    TOP_MARGIN_MIN, TOP_MARGIN_MAX = s["top_margin"]
+    BOTTOM_GAP_MIN = s["chin_gap"]
+    HEAD_W_MIN, HEAD_W_MAX = s["head_w"]
+    FILE_KB_MIN, FILE_KB_MAX = s["kb"]
+    BG_RGB = s["bg"]
+    BG_BGR = s["bg"][::-1]
+    return s
 
 # 人体测量比例（test_geometry.py 里有标定用例，可用命令行覆盖）
 CHIN_IOD_RATIO = 1.77  # (下巴 - 眼线) / 瞳距；成人常见 1.70~1.85
@@ -421,7 +462,7 @@ class YuNetDetector:
         ph = int(np.ceil(small.shape[0] / 32.0) * 32)
         pw = int(np.ceil(small.shape[1] / 32.0) * 32)
         pad = cv2.copyMakeBorder(small, 0, ph - small.shape[0], 0, pw - small.shape[1],
-                                 cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                                 cv2.BORDER_CONSTANT, value=BG_BGR)
         self.net.setInputSize((pw, ph))
         n, res = self.net.detect(pad)
         faces = []
@@ -520,11 +561,11 @@ def whiten_background(bgr: np.ndarray, tol: int = 14,
                    (w // 2, 0), (0, h // 2), (w - 1, h // 2), (w // 2, h - 1)):
         if mask[sy + 1, sx + 1]:
             continue
-        cv2.floodFill(bgr, mask, (sx, sy), (255, 255, 255),
+        cv2.floodFill(bgr, mask, (sx, sy), BG_BGR,
                       loDiff=(tol, tol, tol), upDiff=(tol, tol, tol),
                       flags=cv2.FLOODFILL_FIXED_RANGE)
     region = mask[1:-1, 1:-1] == 1               # 泛洪写入的是 1，屏障是 255
-    bgr[region] = 255
+    bgr[region] = BG_BGR
     return bgr, float(region.mean())
 
 
@@ -546,7 +587,9 @@ def place_matrix(geom: HeadGeom, eye_center: tuple[float, float], angle_deg: flo
 
 
 def warp(img: np.ndarray, m: np.ndarray, scale: float, nearest: bool = False,
-         border=(255, 255, 255)) -> np.ndarray:
+         border=None) -> np.ndarray:
+    if border is None:
+        border = BG_BGR          # 画布外补的是背景色，不是写死的白
     if nearest:
         flags = cv2.INTER_NEAREST
     else:
@@ -559,13 +602,12 @@ def solve_scale(geom: HeadGeom, top_margin: float, target_head_h: float,
                 warnings: list[str], gain: float = 1.0) -> float:
     """选缩放系数：硬约束 = 头高区间 + 头顶留白 / 下巴留白；软约束 = 耳间头宽。
 
-    头宽（含耳廓与发量）和头高有可能无法同时满足规范：规范允许的极限比是
-    260/330≈0.79，而本图实测头宽/头高≈0.83（耳朵外张 + 发量厚），此时无解。
-    冲突时优先保证头部高度——人脸识别看的是头部尺寸，头宽只是构图参考——并在
-    报告里以 WARN 说明，而不是把头部缩到规范下限以下。
+    头宽（含耳廓与发量）与头高可能无法同时落在规范区间内（极限比 260/330≈0.79，
+    本目录样本实测 0.78~0.83）。头宽只是构图参考、不参与自检判定：软区间能守住
+    就守住（避免脸撑满画面），守不住就让位给头高，不报警。
 
     gain 是“成品复测 ÷ 源图推算”的头高修正系数，只作用于头高这条硬约束：
-    成品复测的头宽和源图推算几乎一致（实测差 &lt;1px），跟着一起缩放会把宽度上限
+    成品复测的头宽和源图推算几乎一致（实测差 <1px），跟着一起缩放会把宽度上限
     越压越低，反而把缩放系数拽下去，闭环就永远修不回来。
     """
     hh = geom.head_h * gain
@@ -578,11 +620,6 @@ def solve_scale(geom: HeadGeom, top_margin: float, target_head_h: float,
     lo, hi = max(hard_lo, HEAD_W_MIN / geom.head_w), min(hard_hi, HEAD_W_MAX / geom.head_w)
     span = (lo, hi) if lo <= hi else (hard_lo, hard_hi)
     return float(min(max(target_head_h / hh, span[0]), span[1]))
-
-
-def width_unavoidable(geom: HeadGeom) -> bool:
-    """头宽超限是否属于“无法通过缩放解决”的情况。"""
-    return HEAD_W_MAX / geom.head_w * geom.head_h < HEAD_H_MIN
 
 
 def encode_jpeg(pil: Image.Image, quality: int, dpi: int) -> bytes:
@@ -677,6 +714,20 @@ def write_json_report(path: str, rows: list, warnings: list, metrics: dict) -> N
 
 def process(args: argparse.Namespace) -> int:
     warnings: list[str] = []
+    # 规格先行：把选中的规格绑成模块常量，再把没显式指定的构图/体积参数填上规格值。
+    spec = apply_spec(args.spec)
+    if args.target_head_h is None:
+        args.target_head_h = spec["aim_head_h"]
+    if args.top_margin is None:
+        args.top_margin = spec["aim_top_margin"]
+    if args.min_kb is None:
+        args.min_kb = spec["kb"][0]
+    if args.max_kb is None:
+        args.max_kb = spec["kb"][1]
+    if args.dpi is None:
+        args.dpi = spec["dpi"]
+    log(f"[-] 规格 {args.spec}（{spec['name']}）画布 {CANVAS_W}x{CANVAS_H} "
+        f"头高 {HEAD_H_MIN}-{HEAD_H_MAX} 背景 RGB{BG_RGB}")
     log(f"[-] 读取 {args.input}")
     rgb = load_rgb(args.input)
     log(f"    原始尺寸 {rgb.size[0]}x{rgb.size[1]}")
@@ -839,23 +890,9 @@ def process(args: argparse.Namespace) -> int:
         # 完全看不懂；人工量照片读的也是整数像素。
         h_px, w_px = round(geom_out.head_h), round(geom_out.head_w)
         tm_px, bg_px = round(top_margin), round(bottom_gap)
-        w_ok = HEAD_W_MIN <= w_px <= HEAD_W_MAX
-        if not w_ok and width_unavoidable(geom_out):
-            w_state: bool | str = "warn"
-            need_h = HEAD_W_MAX / geom_out.head_w * geom_out.head_h
-            warnings.append(
-                f"两耳之间 {geom_out.head_w:.0f}px 超出 {HEAD_W_MIN}-{HEAD_W_MAX}："
-                f"这张照片 宽/头高 = {geom_out.head_w / geom_out.head_h:.2f}，"
-                f"而规范允许的极限是 {HEAD_W_MAX}/{HEAD_H_MIN} = {HEAD_W_MAX / HEAD_H_MIN:.2f}；"
-                f"把宽度压到 {HEAD_W_MAX}px 时头高只剩 {need_h:.0f}px（低于 {HEAD_H_MIN}）。"
-                f"两条约束对这张头型无法同时成立，已优先保证头部高度")
-        else:
-            w_state = w_ok
         rows += [
             ("头部高度", f"{h_px} px", f"{HEAD_H_MIN}-{HEAD_H_MAX} px",
              HEAD_H_MIN <= h_px <= HEAD_H_MAX),
-            ("头部宽度(含耳)", f"{w_px} px", f"{HEAD_W_MIN}-{HEAD_W_MAX} px",
-             w_state),
             ("头顶留白", f"{tm_px} px", f"{TOP_MARGIN_MIN}-{TOP_MARGIN_MAX} px",
              TOP_MARGIN_MIN <= tm_px <= TOP_MARGIN_MAX),
             ("下巴距下边缘", f"{bg_px} px", f"≥{BOTTOM_GAP_MIN} px",
@@ -866,8 +903,8 @@ def process(args: argparse.Namespace) -> int:
     else:
         rows.append(("头部测量", "成品内未检出人脸", "—", False))
 
-    pure = float((canvas == 255).all(axis=2).mean())
-    rows.append(("背景纯白", f"纯白 {pure * 100:.1f}% 画面", "RGB(255,255,255)", pure > 0.15))
+    pure = float((canvas == np.array(BG_BGR)).all(axis=2).mean())
+    rows.append(("背景", f"纯色 {pure * 100:.1f}% 画面", f"RGB{BG_RGB}", pure > 0.15))
     if args.write:
         rows.append(("文件格式", f"JPEG q={quality} dpi={args.dpi}", "24bit JPEG", True))
         rows.append(("文件体积", f"{kb:.1f} KB", f"{args.min_kb:.0f}-{args.max_kb:.0f} KB",
@@ -917,7 +954,7 @@ def measure_output(detector, canvas: np.ndarray, args: argparse.Namespace,
             dy, dx = extra_h / 2.0, extra_w / 2.0
             big = cv2.copyMakeBorder(canvas, int(dy), int(extra_h - dy), int(dx),
                                      int(extra_w - dx), cv2.BORDER_CONSTANT,
-                                     value=(255, 255, 255))
+                                     value=BG_BGR)
             again = detector.detect(big)
             if again:
                 face = _unpad(again[0], dx, dy)
@@ -1008,6 +1045,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("input", help="输入照片")
     p.add_argument("output", help="输出 JPEG")
+    p.add_argument("--spec", default=DEFAULT_SPEC, choices=sorted(SPECS),
+                   help="证件类型（决定画布/头高/留白/背景/体积；单项 flag 可覆盖）")
     p.add_argument("--model", help=f"YuNet onnx 路径（默认 models/{YUNET_NAME}，缺失时自动下载）")
     p.add_argument("--no-download", action="store_true", help="禁止联网下载模型")
     p.add_argument("--score-thr", type=float, default=0.6, help="YuNet 置信度阈值")
@@ -1029,18 +1068,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # 下巴留白(≥82)，头高最多 472-35-82 = 355。可行区间 [330, 355]。
     # 目标取偏上的 346：成品复测比源图量法低 1~5%（发际被提亮、人脸框随占比
     # 变化），贴着下限选就会掉到 328/329。
-    p.add_argument("--target-head-h", type=float, default=346.0,
-                   help="目标头部高度 px（可行区间 330-355，默认 346 给复测噪声留余量）")
-    p.add_argument("--top-margin", type=float, default=40.0,
-                   help="目标头顶留白 px（规范 35-59；取小值给头高和下巴留白腾空间）")
+    p.add_argument("--target-head-h", type=float, default=None,
+                   help="目标头部高度 px（默认取规格表里给复测噪声留了余量的值）")
+    p.add_argument("--top-margin", type=float, default=None,
+                   help="目标头顶留白 px（默认取规格表值；取小值给头高和下巴留白腾空间）")
     p.add_argument("--chin-iod-ratio", type=float, default=CHIN_IOD_RATIO,
                    help="(下巴-眼线)/瞳距")
     p.add_argument("--crown-ratio", type=float, default=CROWN_RATIO,
                    help="兜底比例：(头顶-眼线)/(下巴-眼线)")
     p.add_argument("--ear-ratio", type=float, default=EAR_RATIO, help="兜底比例：耳间宽/人脸框宽")
-    p.add_argument("--min-kb", type=float, default=FILE_KB_MIN, help="目标体积下限")
-    p.add_argument("--max-kb", type=float, default=FILE_KB_MAX, help="目标体积上限")
-    p.add_argument("--dpi", type=int, default=600, help="写入 JPEG 的 DPI")
+    p.add_argument("--min-kb", type=float, default=None, help="目标体积下限（默认取规格表）")
+    p.add_argument("--max-kb", type=float, default=None, help="目标体积上限（默认取规格表）")
+    p.add_argument("--dpi", type=int, default=None, help="写入 JPEG 的 DPI（默认取规格表）")
     p.add_argument("--no-write", dest="write", action="store_false", help="只分析不写文件")
     p.add_argument("--debug", nargs="?", const=True, default=False, help="输出调试叠加图（可跟路径）")
     p.add_argument("--json-report", help="把自检结果写成 JSON（供服务程序读取，不影响终端输出）")
