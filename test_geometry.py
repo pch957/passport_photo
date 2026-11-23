@@ -91,10 +91,11 @@ def _t_scale_ok():
 def _t_scale_conflict():
     g = pp.HeadGeom(crown_y=0, eye_y=800, chin_y=1600, head_h=1600, head_w=1400,
                     crown_off=800, chin_off=800, iod=450, roll=0.0)
-    s = pp.solve_scale(g, 45, 340, [])
+    warns: list[str] = []
+    s = pp.solve_scale(g, 45, 340, warns)
     assert g.head_h * s >= pp.HEAD_H_MIN - 1e-6, \
         f"头宽冲突时把头缩到了 {g.head_h * s:.0f}px，低于下限"
-    assert pp.width_unavoidable(g), "该例应判定为“缩放无解”"
+    assert not warns, f"头宽只是软约束，守不住就该安静让位，不该报警：{warns}"
 
 
 @case("solve_scale 留白夹住上限")

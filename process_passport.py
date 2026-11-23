@@ -108,14 +108,43 @@ BG_BGR = BG_RGB[::-1]                    # 同上，cv2 的通道顺序
 #   kb           交付 JPEG 体积区间
 #   dpi          写进 JPEG 的 DPI
 #   aim_head_h / aim_top_margin  构图目标值：取可行区间偏上，给成品复测噪声留余量
+#   ipd / eye_y    可选：《出入境证件相片照相指引》数码列的瞳距（倍宽）与眼位（倍高）
+#                  区间。只出自检、不参与构图，所以判 WARN 不判 FAIL——构图没变，
+#                  不能因为一条新加的校验把原来合格的成品说成不合格。
 # 数值来源与官方出处见 docs/specs.md；apply_spec() 把选中的规格绑到上面的常量。
 # --------------------------------------------------------------------------
+# 《出入境证件相片照相指引》数码相片列（公安部出入境管理局制定，依据 ICAO DOC 9303）：
+#   图像尺寸 宽 354-480 / 高 472-640 / 宽高比 3:4；发际距上边缘 12-35px；
+#   眼睛距上边缘 0.3-0.5 倍高（成人）；两眼间距离 0.23-0.33 倍宽。
+# 我们的构图（留白 35-59 + 头高 330-390）换算到眼位约 0.44-0.50 倍高，压在官方上沿，
+# 所以这两条只作提示：构图没动，成品是否合格仍由头高/留白/下巴距决定。
+NIA_CHECK = dict(ipd=(0.23, 0.33), eye_y=(0.30, 0.50))
+
 SPECS: dict[str, dict] = {
     # 中国护照 / “中国领事”App：33×48mm @600DPI
     "passport": dict(
         name="中国护照", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
         chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
-        aim_head_h=346.0, aim_top_margin=40.0),
+        aim_head_h=346.0, aim_top_margin=40.0, **NIA_CHECK),
+
+    # 往来港澳 / 往来台湾通行证、回乡证、台胞证：国家移民管理局的办事指南逐字写
+    # 「提交符合《出入境证件相片照相指引》标准的照片」，几何与护照完全一套，只差文案。
+    "hk_macau_permit": dict(
+        name="往来港澳通行证", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
+        chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
+        aim_head_h=346.0, aim_top_margin=40.0, **NIA_CHECK),
+    "tw_permit": dict(
+        name="往来台湾通行证", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
+        chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
+        aim_head_h=346.0, aim_top_margin=40.0, **NIA_CHECK),
+    "home_return_permit": dict(
+        name="回乡证", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
+        chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
+        aim_head_h=346.0, aim_top_margin=40.0, **NIA_CHECK),
+    "taiwan_permit": dict(
+        name="台胞证", canvas=(354, 472), head_h=(330, 390), top_margin=(35, 59),
+        chin_gap=82, head_w=(177, 260), bg=(255, 255, 255), kb=(40.0, 75.0), dpi=600,
+        aim_head_h=346.0, aim_top_margin=40.0, **NIA_CHECK),
 
     # 美国签证 DS-160：2×2 英寸，官方数字通道要求正方形 JPEG 600–1200px、≤240KB。
     # 头部（发顶到下巴）占画面高度 50–69%；眼睛距下边缘 56–69%。
@@ -175,6 +204,14 @@ SPECS: dict[str, dict] = {
         chin_gap=90, head_w=(520, 820), bg=(235, 235, 235), kb=(120.0, 1200.0), dpi=600,
         aim_head_h=803.0, aim_top_margin=125.0),
 
+    # 机动车驾驶证（交管12123 电子照）：官方要「带透明度通道的 PNG，宽 520 高 756，
+    # 不超过 300K，不得修图美颜」。头宽 14-16mm / 头长 19-22mm 是纸质档案照口径
+    # （32×22mm），按同比例落到 520×756 就是 331-378 / 449-520px。
+    "cn_driving": dict(
+        name="机动车驾驶证", canvas=(520, 756), head_h=(449, 520), top_margin=(40, 90),
+        chin_gap=150, head_w=(331, 378), bg=(255, 255, 255), kb=(30.0, 300.0), dpi=300,
+        aim_head_h=485.0, aim_top_margin=60.0, fmt="png_alpha"),
+
     # 加拿大在线申请：3:2 竖幅 ≥1200×1800px、200KB–5MB，下巴到头顶占画面 45–50%。
     "ca_visa": dict(
         name="加拿大签证", canvas=(1200, 1800), head_h=(810, 900), top_margin=(150, 300),
@@ -182,13 +219,16 @@ SPECS: dict[str, dict] = {
         aim_head_h=855.0, aim_top_margin=225.0),
 }
 DEFAULT_SPEC = "passport"
+OUT_FMT = "jpeg"
+IPD_FRAC: tuple[float, float] | None = None
+EYE_Y_FRAC: tuple[float, float] | None = None
 
 
 def apply_spec(spec_id: str) -> dict:
     """把规格表绑到模块常量上：全流程只读这些常量，绑一次就整体切换规格。"""
     global CANVAS_W, CANVAS_H, HEAD_W_MIN, HEAD_W_MAX, HEAD_H_MIN, HEAD_H_MAX
     global TOP_MARGIN_MIN, TOP_MARGIN_MAX, BOTTOM_GAP_MIN, FILE_KB_MIN, FILE_KB_MAX
-    global BG_RGB, BG_BGR, HEAD_H_GUARD
+    global BG_RGB, BG_BGR, HEAD_H_GUARD, IPD_FRAC, EYE_Y_FRAC, OUT_FMT
     s = SPECS[spec_id]
     CANVAS_W, CANVAS_H = s["canvas"]
     HEAD_H_MIN, HEAD_H_MAX = s["head_h"]
@@ -200,6 +240,9 @@ def apply_spec(spec_id: str) -> dict:
     BG_BGR = s["bg"][::-1]
     # 复测噪声随画幅放大：护照 354px 上 3px 够了，1600px 的画布要按同比例放宽
     HEAD_H_GUARD = max(3, round(CANVAS_H * 0.006))
+    OUT_FMT = s.get("fmt", "jpeg")
+    IPD_FRAC = s.get("ipd")
+    EYE_Y_FRAC = s.get("eye_y")
     return s
 
 # 人体测量比例（test_geometry.py 里有标定用例，可用命令行覆盖）
@@ -689,6 +732,32 @@ def solve_scale(geom: HeadGeom, top_margin: float, target_head_h: float,
     return float(min(max(target_head_h / hh, span[0]), span[1]))
 
 
+def encode_png(pil: Image.Image, max_kb: float, warnings: list[str]) -> bytes:
+    """透明底 PNG：先无损压，超上限再退到 256 色调色板（交管只卡 300K，不卡色深）。
+
+    全彩 RGBA 在 520×756 上无损要 450–520KB，压不进 300K，所以量化是常态而不是兜底：
+    PNG 的调色板上限就是 256 色，透明通道按索引存（tRNS），半透明的发丝边缘能保住。
+    """
+    arr = np.asarray(pil).copy()
+    arr[arr[..., 3] == 0] = 0      # 全透明像素的 RGB 清零，不然背景噪声白占压缩预算
+    pil = Image.fromarray(arr, "RGBA")
+    buf = io.BytesIO()
+    pil.save(buf, format="PNG", optimize=True, compress_level=9)
+    if buf.tell() / 1024.0 <= max_kb:
+        return buf.getvalue()
+    try:
+        q = pil.quantize(colors=256, method=Image.Quantize.FASTOCTREE)
+    except Exception:                      # 老版本 PIL 或量化失败：原样交付，交给自检报警
+        warnings.append("PNG 超过体积上限且量化失败，已按原样交付")
+        return buf.getvalue()
+    buf2 = io.BytesIO()
+    q.save(buf2, format="PNG", optimize=True, compress_level=9)
+    if buf2.tell() < buf.tell():
+        warnings.append("PNG 超过体积上限，已量化到 256 色交付（透明通道保留，不动五官与构图）")
+        return buf2.getvalue()
+    return buf.getvalue()
+
+
 def encode_jpeg(pil: Image.Image, quality: int, dpi: int) -> bytes:
     buf = io.BytesIO()
     pil.save(buf, format="JPEG", quality=quality, optimize=True, dpi=(dpi, dpi))
@@ -801,12 +870,14 @@ def process(args: argparse.Namespace) -> int:
 
     # 1) 抠图 + 纯白底
     alpha = None
+    rgba_np: np.ndarray | None = None
     if args.no_bg_remove:
         bgr = cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
         warnings.append("已跳过抠图（--no-bg-remove），背景不会变成纯白")
     else:
-        bgr, alpha = composite_white(remove_background(rgb, args.rembg_model,
-                                                       not args.no_matting))
+        rgba_img = remove_background(rgb, args.rembg_model, not args.no_matting)
+        bgr, alpha = composite_white(rgba_img)
+        rgba_np = np.asarray(rgba_img) if OUT_FMT == "png_alpha" else None
     mask = subject_mask(bgr, alpha)
     if alpha is None and mask.mean() > 0.9:
         # 没抠图又不在白墙前：整幅画面都被当成“主体”，剪影量出来的头顶/头宽是假的
@@ -879,16 +950,18 @@ def process(args: argparse.Namespace) -> int:
     # 3) 构图：缩放 + 旋转一次仿射；按成品残差再校正一次倾斜
     ref_frac = face.bbox[3] / float(bgr.shape[0])   # 源图里人脸占画面高度的比例
     canvas = None
+    rgba_canvas: np.ndarray | None = None
     canvas_mask: np.ndarray | None = None
     geom_out: HeadGeom | None = None
     face_out: Face | None = None
     scale = 1.0
     gain = 1.0     # 源图量法 → 成品量法 的实测修正系数（检测噪声 + 重采样，约 1~2%）
-    best: tuple | None = None    # (头高偏差, canvas, mask, geom_out, face_out, scale)
+    best: tuple | None = None    # (头高偏差, canvas, mask, geom_out, face_out, scale, rgba)
     for attempt in range(4):
         scale = solve_scale(geom, args.top_margin, args.target_head_h, warnings, gain)
         m = place_matrix(geom, face.eye_center, angle, scale, args.top_margin)
         warped = warp(bgr, m, scale)
+        rgba_canvas = warp(rgba_np, m, scale, border=(0, 0, 0, 0)) if rgba_np is not None else None
         canvas_mask = warp(barrier_u8, m, scale, nearest=True) > 127 \
             if barrier_u8 is not None else None
         # 头廓必须在提亮背景之前量：whiten 会把发际边缘的浅色头发并进白背景，
@@ -908,7 +981,7 @@ def process(args: argparse.Namespace) -> int:
         err = 0.0 if HEAD_H_MIN <= h_px <= HEAD_H_MAX else \
             min(abs(h_px - HEAD_H_MIN), abs(h_px - HEAD_H_MAX))
         if best is None or err < best[0]:
-            best = (err, canvas, canvas_mask, geom_out, face_out, scale)
+            best = (err, canvas, canvas_mask, geom_out, face_out, scale, rgba_canvas)
         residual = face_out.roll_angle
         if attempt == 0 and abs(residual) > 1.5:
             log(f"[-] 成品残差倾斜 {residual:.2f}°，追加校正后重建")
@@ -929,7 +1002,7 @@ def process(args: argparse.Namespace) -> int:
         break
 
     if best is not None and best[1] is not canvas:
-        _, canvas, canvas_mask, geom_out, face_out, scale = best
+        _, canvas, canvas_mask, geom_out, face_out, scale, rgba_canvas = best
         warnings.append("多次重建后取头高最接近规范的一版")
         log(f"[-] 取最优一版：成品头高 {geom_out.head_h:.0f}px")
 
@@ -938,8 +1011,15 @@ def process(args: argparse.Namespace) -> int:
     quality = 0
     data = b""
     if args.write:
-        pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
-        data, quality = compress_to_range(pil, args.min_kb, args.max_kb, args.dpi, warnings)
+        if OUT_FMT == "png_alpha" and rgba_canvas is not None:
+            pil = Image.fromarray(rgba_canvas, "RGBA")
+            data = encode_png(pil, args.max_kb, warnings)
+            quality = 0
+        else:
+            if OUT_FMT == "png_alpha":
+                warnings.append("未抠图，无法输出透明底 PNG，已退回白底 JPEG")
+            pil = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+            data, quality = compress_to_range(pil, args.min_kb, args.max_kb, args.dpi, warnings)
         parent = os.path.dirname(os.path.abspath(args.output))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -970,10 +1050,29 @@ def process(args: argparse.Namespace) -> int:
     else:
         rows.append(("头部测量", "成品内未检出人脸", "—", False))
 
+    # 出入境数码列的瞳距与眼位：官方口径与我们的构图口径不同源，只提示不判死
+    if face_out is not None and (IPD_FRAC or EYE_Y_FRAC):
+        import math as _math
+        ipd = _math.dist(face_out.left_eye, face_out.right_eye)
+        eye_y = (face_out.left_eye[1] + face_out.right_eye[1]) / 2.0
+        if IPD_FRAC:
+            lo, hi = IPD_FRAC[0] * CANVAS_W, IPD_FRAC[1] * CANVAS_W
+            rows.append(("瞳距", f"{ipd:.0f} px（{ipd / CANVAS_W:.2f}×宽）",
+                         f"{lo:.0f}-{hi:.0f} px（0.23-0.33×宽）",
+                         True if lo <= ipd <= hi else "warn"))
+        if EYE_Y_FRAC:
+            lo, hi = EYE_Y_FRAC[0] * CANVAS_H, EYE_Y_FRAC[1] * CANVAS_H
+            rows.append(("眼睛位置", f"{eye_y:.0f} px（{eye_y / CANVAS_H:.2f}×高）",
+                         f"{lo:.0f}-{hi:.0f} px（0.30-0.50×高）",
+                         True if lo <= eye_y <= hi else "warn"))
+
     pure = float((canvas == np.array(BG_BGR)).all(axis=2).mean())
     rows.append(("背景", f"纯色 {pure * 100:.1f}% 画面", f"RGB{BG_RGB}", pure > 0.15))
     if args.write:
-        rows.append(("文件格式", f"JPEG q={quality} dpi={args.dpi}", "24bit JPEG", True))
+        is_png = OUT_FMT == "png_alpha" and rgba_canvas is not None
+        rows.append(("文件格式",
+                     "PNG 32bit（RGBA 透明底）" if is_png else f"JPEG q={quality} dpi={args.dpi}",
+                     "PNG 带透明通道" if is_png else "24bit JPEG", True))
         rows.append(("文件体积", f"{kb:.1f} KB", f"{args.min_kb:.0f}-{args.max_kb:.0f} KB",
                      args.min_kb <= kb <= args.max_kb))
     rows.append(("检测引擎", detector.name + ("+LBF" if refine_info else ""), "YuNet", None))
