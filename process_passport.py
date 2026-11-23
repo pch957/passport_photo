@@ -556,24 +556,28 @@ def warp(img: np.ndarray, m: np.ndarray, scale: float, nearest: bool = False,
 
 
 def solve_scale(geom: HeadGeom, top_margin: float, target_head_h: float,
-                warnings: list[str]) -> float:
+                warnings: list[str], gain: float = 1.0) -> float:
     """选缩放系数：硬约束 = 头高区间 + 头顶留白 / 下巴留白；软约束 = 耳间头宽。
 
     头宽（含耳廓与发量）和头高有可能无法同时满足规范：规范允许的极限比是
     260/330≈0.79，而本图实测头宽/头高≈0.83（耳朵外张 + 发量厚），此时无解。
     冲突时优先保证头部高度——人脸识别看的是头部尺寸，头宽只是构图参考——并在
     报告里以 WARN 说明，而不是把头部缩到规范下限以下。
+
+    gain 是“成品复测 ÷ 源图推算”的头高修正系数，只作用于头高这条硬约束：
+    成品复测的头宽和源图推算几乎一致（实测差 &lt;1px），跟着一起缩放会把宽度上限
+    越压越低，反而把缩放系数拽下去，闭环就永远修不回来。
     """
-    # 区间两端各让 HEAD_H_GUARD：成品复测有 1~2% 噪声，贴着 330 选就会掉到 328/329
-    hard_lo = (HEAD_H_MIN + HEAD_H_GUARD) / geom.head_h
-    hard_hi = min((HEAD_H_MAX - HEAD_H_GUARD) / geom.head_h,
-                  (CANVAS_H - top_margin - BOTTOM_GAP_MIN) / geom.head_h)
+    hh = geom.head_h * gain
+    hard_lo = (HEAD_H_MIN + HEAD_H_GUARD) / hh
+    hard_hi = min((HEAD_H_MAX - HEAD_H_GUARD) / hh,
+                  (CANVAS_H - top_margin - BOTTOM_GAP_MIN) / hh)
     if hard_lo > hard_hi:      # 头太长，留白放不下
         warnings.append("头高与下巴留白冲突，已取留白允许范围内的最大头部")
         hard_lo = hard_hi
     lo, hi = max(hard_lo, HEAD_W_MIN / geom.head_w), min(hard_hi, HEAD_W_MAX / geom.head_w)
     span = (lo, hi) if lo <= hi else (hard_lo, hard_hi)
-    return float(min(max(target_head_h / geom.head_h, span[0]), span[1]))
+    return float(min(max(target_head_h / hh, span[0]), span[1]))
 
 
 def width_unavoidable(geom: HeadGeom) -> bool:
@@ -763,21 +767,25 @@ def process(args: argparse.Namespace) -> int:
     scale = 1.0
     gain = 1.0     # 源图量法 → 成品量法 的实测修正系数（检测噪声 + 重采样，约 1~2%）
     best: tuple | None = None    # (头高偏差, canvas, mask, geom_out, face_out, scale)
-    prev_err: float | None = None
     for attempt in range(4):
-        scale = solve_scale(geom.scaled(gain), args.top_margin, args.target_head_h, warnings)
+        scale = solve_scale(geom, args.top_margin, args.target_head_h, warnings, gain)
         m = place_matrix(geom, face.eye_center, angle, scale, args.top_margin)
-        canvas = warp(bgr, m, scale)
+        warped = warp(bgr, m, scale)
         canvas_mask = warp(barrier_u8, m, scale, nearest=True) > 127 \
             if barrier_u8 is not None else None
+        # 头廓必须在提亮背景之前量：whiten 会把发际边缘的浅色头发并进白背景，
+        # 头顶被量低十几像素，头高就永远够不到 330 下限。几何量测用未提亮的
+        # warped，交付用的仍是提亮后的 canvas——两者像素位置完全一致。
+        geom_mask = canvas_mask if canvas_mask is not None else subject_mask(warped)
+        canvas = warped
         if args.whiten:
-            canvas, _ = whiten_background(canvas, args.whiten_tol, barrier=canvas_mask)
-        geom_out, face_out = measure_output(detector, canvas, args, ref_frac, canvas_mask)
+            canvas, _ = whiten_background(warped, args.whiten_tol, barrier=canvas_mask)
+        geom_out, face_out = measure_output(detector, warped, args, ref_frac, geom_mask)
         if geom_out is None or face_out is None:
             warnings.append("成品中未再次检测到人脸，无法自检构图")
             break
-        # 只朝“更靠近规范”的方向走，并且永远保留最好的一版：成品复测在特写、
-        # 发际被提亮吃掉等情况下会反向偏移，不锁最优就会越修越糟。
+        # 永远保留头高最接近规范的一版：个别照片的成品量法会反向偏移，
+        # 不锁最优就可能越修越糟。
         h_px = round(geom_out.head_h)
         err = 0.0 if HEAD_H_MIN <= h_px <= HEAD_H_MAX else \
             min(abs(h_px - HEAD_H_MIN), abs(h_px - HEAD_H_MAX))
@@ -788,19 +796,15 @@ def process(args: argparse.Namespace) -> int:
             log(f"[-] 成品残差倾斜 {residual:.2f}°，追加校正后重建")
             angle += residual
             continue
-        # 闭环校正：源图量出来的头高和成品复测的头高有 1~2% 系统偏差（人脸框随
-        # 占比变化、重采样、背景提亮都会影响 landmark）。不闭环就会卡在 328/329
-        # 这种只差一两像素的位置——明明该落在区间里。
-        if err > 0 and attempt < 3 and (prev_err is None or err < prev_err):
-            # 只补到区间内侧一点点，不奔着目标值去：差 1px 就动 1px 的量，
-            # 大幅改缩放在这类照片上会把成品量法拉得更低。
-            want = (HEAD_H_MIN + HEAD_H_GUARD) if h_px < HEAD_H_MIN else (HEAD_H_MAX - HEAD_H_GUARD)
-            fix = want / geom_out.head_h
-            if 0.70 <= fix <= 1.40:
+        # 闭环校正：bias = 成品复测 ÷ 源图推算。bias<1 说明同一张脸在成品里量得
+        # 更小（人脸框随占比变化、重采样、发际被提亮吃掉），那就得把缩放**放大**——
+        # 是除以 bias 不是乘，方向搞反就会越修越小（之前就是这样翻车的）。
+        if err > 0 and attempt < 3:
+            bias = geom_out.head_h / max(1.0, geom.head_h * scale)
+            if 0.6 <= bias <= 1.6 and abs(bias - gain) > 0.002:
                 log(f"[-] 成品头高 {geom_out.head_h:.0f}px 不在 {HEAD_H_MIN}-{HEAD_H_MAX}，"
-                    f"按实测偏差修正缩放（×{fix:.3f}）后重建")
-                prev_err = err
-                gain *= fix
+                    f"实测/推算 = {bias:.3f}，按此回修缩放后重建")
+                gain = bias
                 continue
         log(f"[-] 缩放系数 {scale:.4f}（目标头高 {args.target_head_h:.0f}px）"
             f" 成品残差倾斜 {residual:.2f}°")
